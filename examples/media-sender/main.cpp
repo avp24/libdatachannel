@@ -14,14 +14,17 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -40,6 +43,145 @@ using namespace std::chrono_literals;
 
 const int BUFFER_SIZE = 2048;
 
+static std::vector<std::vector<std::byte>> parseAnnexBNalus(const std::vector<std::byte> &data) {
+	std::vector<std::vector<std::byte>> nalus;
+	const size_t size = data.size();
+	size_t i = 0;
+
+	auto isStartCode = [&](size_t pos, size_t &len) {
+		if (pos + 3 >= size)
+			return false;
+		if (data[pos] == std::byte{0x00} && data[pos + 1] == std::byte{0x00}) {
+			if (data[pos + 2] == std::byte{0x01}) {
+				len = 3;
+				return true;
+			}
+			if (pos + 3 < size && data[pos + 2] == std::byte{0x00} &&
+			    data[pos + 3] == std::byte{0x01}) {
+				len = 4;
+				return true;
+			}
+		}
+		return false;
+	};
+
+	while (i + 3 < size) {
+		size_t startLen = 0;
+		while (i + 3 < size && !isStartCode(i, startLen))
+			++i;
+		if (i + 3 >= size)
+			break;
+		size_t start = i + startLen;
+		i = start;
+
+		size_t nextLen = 0;
+		while (i + 3 < size && !isStartCode(i, nextLen))
+			++i;
+		size_t end = i;
+		if (end > start) {
+			nalus.emplace_back(data.begin() + start, data.begin() + end);
+		}
+	}
+
+	return nalus;
+}
+
+static std::vector<rtc::binary> buildFramesFromNalus(
+    const std::vector<std::vector<std::byte>> &nalus) {
+	bool hasAud = false;
+	for (const auto &nalu : nalus) {
+		if (nalu.empty())
+			continue;
+		uint8_t type = static_cast<uint8_t>(nalu[0]) & 0x1F;
+		if (type == 9) {
+			hasAud = true;
+			break;
+		}
+	}
+
+	std::vector<rtc::binary> frames;
+	std::optional<std::vector<std::byte>> lastSps;
+	std::optional<std::vector<std::byte>> lastPps;
+
+	auto pushFrame = [&](const std::vector<std::vector<std::byte>> &frameNalus) {
+		rtc::binary frame;
+		for (const auto &nalu : frameNalus) {
+			static const std::byte startCode[4] = {std::byte{0x00}, std::byte{0x00},
+			                                      std::byte{0x00}, std::byte{0x01}};
+			frame.insert(frame.end(), std::begin(startCode), std::end(startCode));
+			frame.insert(frame.end(), nalu.begin(), nalu.end());
+		}
+		if (!frame.empty())
+			frames.emplace_back(std::move(frame));
+	};
+
+	if (hasAud) {
+		std::vector<std::vector<std::byte>> current;
+		bool hasSps = false;
+		bool hasPps = false;
+
+		for (const auto &nalu : nalus) {
+			if (nalu.empty())
+				continue;
+			uint8_t type = static_cast<uint8_t>(nalu[0]) & 0x1F;
+			if (type == 7) {
+				lastSps = nalu;
+				hasSps = true;
+			} else if (type == 8) {
+				lastPps = nalu;
+				hasPps = true;
+			}
+
+			if (type == 9) {
+				if (!current.empty()) {
+					pushFrame(current);
+					current.clear();
+					hasSps = false;
+					hasPps = false;
+				}
+				continue;
+			}
+
+			if (type == 5) {
+				if (lastSps && !hasSps) {
+					current.push_back(*lastSps);
+					hasSps = true;
+				}
+				if (lastPps && !hasPps) {
+					current.push_back(*lastPps);
+					hasPps = true;
+				}
+			}
+
+			current.push_back(nalu);
+		}
+		if (!current.empty())
+			pushFrame(current);
+	} else {
+		for (const auto &nalu : nalus) {
+			if (nalu.empty())
+				continue;
+			uint8_t type = static_cast<uint8_t>(nalu[0]) & 0x1F;
+			if (type == 7)
+				lastSps = nalu;
+			else if (type == 8)
+				lastPps = nalu;
+
+			std::vector<std::vector<std::byte>> frameNalus;
+			if (type == 5) {
+				if (lastSps)
+					frameNalus.push_back(*lastSps);
+				if (lastPps)
+					frameNalus.push_back(*lastPps);
+			}
+			frameNalus.push_back(nalu);
+			pushFrame(frameNalus);
+		}
+	}
+
+	return frames;
+}
+
 int main(int argc, char **argv) {
 	try {
 		rtc::InitLogger(rtc::LogLevel::Debug);
@@ -48,6 +190,9 @@ int main(int argc, char **argv) {
 		uint16_t signalingPort = 8000;
 		std::string localId = "sender";
 		std::string remoteId = "browser";
+		std::string h264FilePath;
+		uint32_t fps = 30;
+		bool loopFile = true;
 
 		for (int i = 1; i < argc; ++i) {
 			std::string arg = argv[i];
@@ -59,14 +204,25 @@ int main(int argc, char **argv) {
 				localId = argv[++i];
 			} else if (arg == "--remote-id" && i + 1 < argc) {
 				remoteId = argv[++i];
+			} else if (arg == "--h264-file" && i + 1 < argc) {
+				h264FilePath = argv[++i];
+			} else if (arg == "--fps" && i + 1 < argc) {
+				fps = static_cast<uint32_t>(std::stoi(argv[++i]));
+			} else if (arg == "--no-loop") {
+				loopFile = false;
 			} else if (arg == "--help") {
 				std::cout << "usage: media-sender [--signaling-ip IP] [--signaling-port PORT] "
-				             "[--local-id ID] [--remote-id ID]\n";
+				             "[--local-id ID] [--remote-id ID] [--h264-file PATH] [--fps N] "
+				             "[--no-loop]\n";
 				return 0;
 			} else {
 				std::cerr << "Unknown argument: " << arg << std::endl;
 				return 1;
 			}
+		}
+		if (fps == 0) {
+			std::cerr << "Invalid fps: 0" << std::endl;
+			return 1;
 		}
 
 		auto ws = std::make_shared<rtc::WebSocket>();
@@ -143,6 +299,8 @@ int main(int argc, char **argv) {
 		}
 
 		const rtc::SSRC ssrc = 42;
+		const uint8_t payloadType = 96;
+		const bool useFile = !h264FilePath.empty();
 		auto createPeerConnection = [&]() {
 			reconnecting = true;
 			auto newPc = std::make_shared<rtc::PeerConnection>();
@@ -171,9 +329,21 @@ int main(int argc, char **argv) {
 			    });
 
 			rtc::Description::Video media("video", rtc::Description::Direction::SendOnly);
-			media.addH264Codec(96); // Must match the payload type of the external h264 RTP stream
+			media.addH264Codec(payloadType); // Must match the payload type of the H264 stream
 			media.addSSRC(ssrc, "video-send");
 			auto newTrack = newPc->addTrack(media);
+
+			if (useFile) {
+				auto rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(
+				    ssrc, "video-send", payloadType, rtc::H264RtpPacketizer::ClockRate);
+				auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(
+				    rtc::NalUnit::Separator::StartSequence, rtpConfig);
+				auto srReporter = std::make_shared<rtc::RtcpSrReporter>(rtpConfig);
+				packetizer->addToChain(srReporter);
+				auto nackResponder = std::make_shared<rtc::RtcpNackResponder>();
+				packetizer->addToChain(nackResponder);
+				newTrack->setMediaHandler(packetizer);
+			}
 
 			newPc->setLocalDescription();
 
@@ -187,22 +357,12 @@ int main(int argc, char **argv) {
 			reconnecting = false;
 		};
 
-		SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
-		struct sockaddr_in addr = {};
-		addr.sin_family = AF_INET;
-		addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-		addr.sin_port = htons(6000);
-
-		if (bind(sock, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) < 0)
-			throw std::runtime_error("Failed to bind UDP socket on 127.0.0.1:6000");
-
-		int rcvBufSize = 212992;
-		setsockopt(sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char *>(&rcvBufSize),
-		           sizeof(rcvBufSize));
-
 		createPeerConnection();
 
-		std::cout << "RTP video stream expected on localhost:6000" << std::endl;
+		if (useFile)
+			std::cout << "Streaming H264 file: " << h264FilePath << std::endl;
+		else
+			std::cout << "RTP video stream expected on localhost:6000" << std::endl;
 		std::cout << "Waiting for answer via signaling..." << std::endl;
 
 		std::thread watchdog([&]() {
@@ -224,6 +384,66 @@ int main(int argc, char **argv) {
 			}
 		});
 		watchdog.detach();
+
+		if (useFile) {
+			std::ifstream input(h264FilePath, std::ios::binary);
+			if (!input)
+				throw std::runtime_error("Failed to open H264 file: " + h264FilePath);
+			std::vector<char> fileChars((std::istreambuf_iterator<char>(input)),
+			                            std::istreambuf_iterator<char>());
+			std::vector<std::byte> fileData;
+			fileData.resize(fileChars.size());
+			if (!fileChars.empty())
+				std::memcpy(fileData.data(), fileChars.data(), fileChars.size());
+			auto nalus = parseAnnexBNalus(fileData);
+			auto frames = buildFramesFromNalus(nalus);
+			if (frames.empty())
+				throw std::runtime_error("No frames parsed from H264 file");
+
+			uint64_t frameIndex = 0;
+			while (true) {
+				std::shared_ptr<rtc::Track> currentTrack;
+				{
+					std::lock_guard<std::mutex> lock(pcMutex);
+					currentTrack = track;
+				}
+				if (!currentTrack || !currentTrack->isOpen()) {
+					std::this_thread::sleep_for(50ms);
+					continue;
+				}
+
+				const auto &frame = frames[frameIndex];
+				double seconds = static_cast<double>(frameIndex) / static_cast<double>(fps);
+				rtc::FrameInfo info{std::chrono::duration<double>(seconds)};
+				currentTrack->sendFrame(frame, info);
+				lastPacketMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+				                   std::chrono::steady_clock::now().time_since_epoch())
+				                   .count();
+				idle = false;
+
+				frameIndex++;
+				if (frameIndex >= frames.size()) {
+					if (loopFile)
+						frameIndex = 0;
+					else
+						frameIndex = frames.size() - 1;
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(1000 / fps));
+			}
+		}
+
+		SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
+		struct sockaddr_in addr = {};
+		addr.sin_family = AF_INET;
+		addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+		addr.sin_port = htons(6000);
+
+		if (bind(sock, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) < 0)
+			throw std::runtime_error("Failed to bind UDP socket on 127.0.0.1:6000");
+
+		int rcvBufSize = 212992;
+		setsockopt(sock, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char *>(&rcvBufSize),
+		           sizeof(rcvBufSize));
 
 		// Receive from UDP (keep running even if the sender stops/restarts)
 		char buffer[BUFFER_SIZE];
