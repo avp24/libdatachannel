@@ -6,41 +6,108 @@
 </head>
 <body>
 
-<p>Please enter the offer provided to you by the sender application: </p>
-<textarea cols="80" rows="25"></textarea>
-<button>Submit</button>
+<p id="status">Connecting to signaling...</p>
+<textarea id="log" cols="80" rows="12" readonly></textarea>
 
 <video id="video-element" muted></video>
 
 <script>
-    document.querySelector('button').addEventListener('click',  async () => {
-        const offer = JSON.parse(document.querySelector('textarea').value);
-        const pc = new RTCPeerConnection({
+    const statusEl = document.getElementById('status');
+    const logEl = document.getElementById('log');
+    const signalingUrl = 'ws://127.0.0.1:8000/browser';
+    const remoteId = 'sender';
+
+    function log(line) {
+        logEl.value += line + '\n';
+        logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    let pc = null;
+    let ws = null;
+    const reconnectIntervalMs = 5000;
+    const maxReconnectTotalMs = 30000;
+    let reconnectTimer = null;
+    let reconnectAttempts = 0;
+
+    function createPeerConnection() {
+        if (pc) {
+            pc.close();
+        }
+        pc = new RTCPeerConnection({
             // Recommended for libdatachannel
             bundlePolicy: 'max-bundle',
         });
 
-        pc.onicegatheringstatechange = (state) => {
-            if (pc.iceGatheringState === 'complete') {
+        pc.onicegatheringstatechange = () => {
+            if (pc.iceGatheringState === 'complete' && ws && ws.readyState === WebSocket.OPEN) {
                 // We only want to provide an answer once all of our candidates have been added to the SDP.
                 const answer = pc.localDescription;
-                document.querySelector('textarea').value = JSON.stringify({"type": answer.type, sdp: answer.sdp});
-                document.querySelector('p').value = 'Please paste the answer in the sender application.';
-                alert('Please paste the answer in the sender application.');
+                ws.send(JSON.stringify({id: remoteId, type: answer.type, sdp: answer.sdp}));
+                statusEl.textContent = 'Answer sent. Waiting for media...';
+                log('Answer sent');
             }
+        };
+
+        pc.ontrack = (evt) => {
+            const videoElement = document.getElementById('video-element');
+            videoElement.srcObject = evt.streams[0];
+            videoElement.play();
+            statusEl.textContent = 'Streaming';
+        };
+    }
+
+    function scheduleReconnect() {
+        if (reconnectTimer) {
+            return;
         }
+        if (reconnectAttempts * reconnectIntervalMs >= maxReconnectTotalMs) {
+            statusEl.textContent = 'Signaling disconnected. Giving up.';
+            return;
+        }
+        reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            reconnectAttempts += 1;
+            connectSignaling();
+        }, reconnectIntervalMs);
+    }
 
-		pc.ontrack = (evt) => {
-			const videoElement = document.getElementById('video-element');
-			videoElement.srcObject = evt.streams[0];
-			videoElement.play();
-		};
+    function connectSignaling() {
+        ws = new WebSocket(signalingUrl);
 
-        await pc.setRemoteDescription(offer);
+        ws.onopen = () => {
+            statusEl.textContent = 'Signaling connected. Requesting offer...';
+            reconnectAttempts = 0;
+            ws.send(JSON.stringify({id: remoteId, type: 'request'}));
+        };
 
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-    })
+        ws.onerror = () => {
+            statusEl.textContent = 'Signaling error';
+        };
+
+        ws.onclose = () => {
+            statusEl.textContent = 'Signaling disconnected. Reconnecting...';
+            scheduleReconnect();
+        };
+
+        ws.onmessage = async (evt) => {
+            if (typeof evt.data !== 'string') {
+                return;
+            }
+            const message = JSON.parse(evt.data);
+            if (message.type !== 'offer') {
+                return;
+            }
+            statusEl.textContent = 'Offer received. Creating answer...';
+            log('Offer received');
+
+            createPeerConnection();
+            await pc.setRemoteDescription(message);
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+        };
+    }
+
+    connectSignaling();
 </script>
 
 </body>
