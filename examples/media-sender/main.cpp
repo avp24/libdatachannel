@@ -193,6 +193,11 @@ int main(int argc, char **argv) {
 		std::string h264FilePath;
 		uint32_t fps = 30;
 		bool loopFile = true;
+		std::string stunUrl;
+		std::string turnUrl;
+		std::string turnUser;
+		std::string turnPass;
+		std::string turnTransport = "udp";
 
 		for (int i = 1; i < argc; ++i) {
 			std::string arg = argv[i];
@@ -210,10 +215,22 @@ int main(int argc, char **argv) {
 				fps = static_cast<uint32_t>(std::stoi(argv[++i]));
 			} else if (arg == "--no-loop") {
 				loopFile = false;
+			} else if (arg == "--stun-url" && i + 1 < argc) {
+				stunUrl = argv[++i];
+			} else if (arg == "--turn-url" && i + 1 < argc) {
+				turnUrl = argv[++i];
+			} else if (arg == "--turn-username" && i + 1 < argc) {
+				turnUser = argv[++i];
+			} else if (arg == "--turn-password" && i + 1 < argc) {
+				turnPass = argv[++i];
+			} else if (arg == "--turn-transport" && i + 1 < argc) {
+				turnTransport = argv[++i];
 			} else if (arg == "--help") {
 				std::cout << "usage: media-sender [--signaling-ip IP] [--signaling-port PORT] "
 				             "[--local-id ID] [--remote-id ID] [--h264-file PATH] [--fps N] "
-				             "[--no-loop]\n";
+				             "[--no-loop] [--stun-url URL] [--turn-url URL] "
+				             "[--turn-username USER] [--turn-password PASS] "
+				             "[--turn-transport udp|tcp|tls]\n";
 				return 0;
 			} else {
 				std::cerr << "Unknown argument: " << arg << std::endl;
@@ -223,6 +240,23 @@ int main(int argc, char **argv) {
 		if (fps == 0) {
 			std::cerr << "Invalid fps: 0" << std::endl;
 			return 1;
+		}
+
+		rtc::Configuration pcConfig;
+		if (!stunUrl.empty()) {
+			pcConfig.iceServers.emplace_back(stunUrl);
+		}
+		if (!turnUrl.empty()) {
+			rtc::IceServer::RelayType relayType = rtc::IceServer::RelayType::TurnUdp;
+			if (turnTransport == "tcp")
+				relayType = rtc::IceServer::RelayType::TurnTcp;
+			else if (turnTransport == "tls")
+				relayType = rtc::IceServer::RelayType::TurnTls;
+			pcConfig.iceServers.emplace_back(turnUrl);
+			pcConfig.iceServers.back().type = rtc::IceServer::Type::Turn;
+			pcConfig.iceServers.back().username = turnUser;
+			pcConfig.iceServers.back().password = turnPass;
+			pcConfig.iceServers.back().relayType = relayType;
 		}
 
 		auto ws = std::make_shared<rtc::WebSocket>();
@@ -262,6 +296,7 @@ int main(int argc, char **argv) {
 			if (typeIt == message.end())
 				return;
 			const std::string type = typeIt->get<std::string>();
+			std::cout << "Signaling message: " << type << std::endl;
 
 			if (type == "answer") {
 				const auto sdpIt = message.find("sdp");
@@ -303,10 +338,19 @@ int main(int argc, char **argv) {
 		const bool useFile = !h264FilePath.empty();
 		auto createPeerConnection = [&]() {
 			reconnecting = true;
-			auto newPc = std::make_shared<rtc::PeerConnection>();
+			auto newPc = std::make_shared<rtc::PeerConnection>(pcConfig);
 
 			newPc->onStateChange([](rtc::PeerConnection::State state) {
 				std::cout << "State: " << state << std::endl;
+			});
+			newPc->onIceStateChange([](rtc::PeerConnection::IceState state) {
+				std::cout << "ICE State: " << state << std::endl;
+			});
+			newPc->onSignalingStateChange([](rtc::PeerConnection::SignalingState state) {
+				std::cout << "Signaling State: " << state << std::endl;
+			});
+			newPc->onLocalCandidate([](rtc::Candidate candidate) {
+				std::cout << "Local candidate: " << std::string(candidate) << std::endl;
 			});
 
 			newPc->onGatheringStateChange(

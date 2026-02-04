@@ -14,8 +14,14 @@
 <script>
     const statusEl = document.getElementById('status');
     const logEl = document.getElementById('log');
-    const signalingUrl = 'ws://127.0.0.1:8000/browser';
+    <!--const signalingUrl = 'ws://127.0.0.1:8000/browser'; -->
+    const signalingUrl = 'ws://192.168.1.110:8000/browser';
     const remoteId = 'sender';
+    const stunUrl = 'stun:stun.l.google.com:19302';
+    const turnUrl = '';
+    const turnUser = '';
+    const turnPass = '';
+    const turnTransport = 'udp';
 
     function log(line) {
         logEl.value += line + '\n';
@@ -33,9 +39,22 @@
         if (pc) {
             pc.close();
         }
+        const iceServers = [];
+        if (stunUrl) {
+            iceServers.push({urls: [stunUrl]});
+        }
+        if (turnUrl) {
+            const turnEntry = {urls: [turnUrl], username: turnUser, credential: turnPass};
+            if (turnTransport === 'tcp' || turnTransport === 'tls') {
+                turnEntry.urls = [`${turnUrl}?transport=${turnTransport}`];
+            }
+            iceServers.push(turnEntry);
+        }
+
         pc = new RTCPeerConnection({
             // Recommended for libdatachannel
             bundlePolicy: 'max-bundle',
+            iceServers: iceServers,
         });
 
         pc.onicegatheringstatechange = () => {
@@ -46,6 +65,20 @@
                 statusEl.textContent = 'Answer sent. Waiting for media...';
                 log('Answer sent');
             }
+        };
+
+        pc.onicecandidate = (evt) => {
+            if (evt.candidate) {
+                log('ICE candidate: ' + evt.candidate.candidate);
+            }
+        };
+
+        pc.oniceconnectionstatechange = () => {
+            log('ICE connection state: ' + pc.iceConnectionState);
+        };
+
+        pc.onsignalingstatechange = () => {
+            log('Signaling state: ' + pc.signalingState);
         };
 
         pc.ontrack = (evt) => {
